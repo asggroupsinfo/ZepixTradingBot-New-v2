@@ -17,11 +17,13 @@ class DualOrderManager:
     """
     
     def __init__(self, config: Config, risk_manager: RiskManager, 
-                 mt5_client: MT5Client, pip_calculator: PipCalculator):
+                 mt5_client: MT5Client, pip_calculator: PipCalculator,
+                 profit_sl_calculator=None):
         self.config = config
         self.risk_manager = risk_manager
         self.mt5_client = mt5_client
         self.pip_calculator = pip_calculator
+        self.profit_sl_calculator = profit_sl_calculator  # For Order B (Profit Trail)
         self.logger = logging.getLogger(__name__)
     
     def is_enabled(self) -> bool:
@@ -112,6 +114,12 @@ class DualOrderManager:
             # Get lot size (same for both orders)
             lot_size = self.risk_manager.get_fixed_lot_size(account_balance)
             
+            # DEBUG: Log lot size calculation
+            self.logger.debug(
+                f"[DUAL_ORDER_LOT_SIZE] Symbol={alert.symbol} Balance=${account_balance:.2f} "
+                f"Lot Size={lot_size:.2f} (SAME for both orders)"
+            )
+            
             if lot_size <= 0:
                 result["errors"].append("Invalid lot size")
                 return result
@@ -121,46 +129,65 @@ class DualOrderManager:
                 alert.symbol, lot_size, account_balance
             )
             
+            # DEBUG: Log risk validation
+            self.logger.debug(
+                f"[DUAL_ORDER_RISK] Symbol={alert.symbol} "
+                f"Valid={risk_validation['valid']} Reason={risk_validation.get('reason', 'N/A')}"
+            )
+            
             if not risk_validation["valid"]:
                 result["errors"].append(f"Risk validation failed: {risk_validation['reason']}")
                 return result
             
-            # Calculate SL and TP for both orders (same calculation)
-            sl_price, sl_distance = self.pip_calculator.calculate_sl_price(
+            # Calculate SL and TP for Order A (TP Trail) - uses existing SL system
+            sl_price_a, sl_distance_a = self.pip_calculator.calculate_sl_price(
                 alert.symbol, alert.price, alert.signal, lot_size, account_balance
             )
             
-            tp_price = self.pip_calculator.calculate_tp_price(
-                alert.price, sl_price, alert.signal, self.config.get("rr_ratio", 1.0)
+            tp_price_a = self.pip_calculator.calculate_tp_price(
+                alert.price, sl_price_a, alert.signal, self.config.get("rr_ratio", 1.0)
             )
             
-            # Create Order A (TP Trail)
+            # Calculate SL for Order B (Profit Trail) - uses independent $10 fixed SL
+            if self.profit_sl_calculator:
+                sl_price_b, sl_distance_b = self.profit_sl_calculator.calculate_sl_price(
+                    alert.price, alert.signal, alert.symbol, lot_size
+                )
+            else:
+                # Fallback to same SL as Order A if profit SL calculator not available
+                sl_price_b, sl_distance_b = sl_price_a, sl_distance_a
+            
+            tp_price_b = self.pip_calculator.calculate_tp_price(
+                alert.price, sl_price_b, alert.signal, self.config.get("rr_ratio", 1.0)
+            )
+            
+            # Create Order A (TP Trail) - uses existing SL system
             order_a = Trade(
                 symbol=alert.symbol,
                 entry=alert.price,
-                sl=sl_price,
-                tp=tp_price,
+                sl=sl_price_a,
+                tp=tp_price_a,
                 lot_size=lot_size,
                 direction=alert.signal,
                 strategy=strategy,
                 open_time=datetime.now().isoformat(),
                 original_entry=alert.price,
-                original_sl_distance=sl_distance,
+                original_sl_distance=sl_distance_a,
                 order_type="TP_TRAIL"
             )
             
-            # Create Order B (Profit Trail)
+            # Create Order B (Profit Trail) - uses independent $10 fixed SL
             order_b = Trade(
                 symbol=alert.symbol,
                 entry=alert.price,
-                sl=sl_price,
-                tp=tp_price,
+                sl=sl_price_b,  # Independent $10 fixed SL
+                tp=tp_price_b,
                 lot_size=lot_size,  # Same lot size
                 direction=alert.signal,
                 strategy=strategy,
                 open_time=datetime.now().isoformat(),
                 original_entry=alert.price,
-                original_sl_distance=sl_distance,
+                original_sl_distance=sl_distance_b,
                 order_type="PROFIT_TRAIL"
             )
             

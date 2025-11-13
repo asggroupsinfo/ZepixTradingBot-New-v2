@@ -4,6 +4,8 @@ import os
 import sys
 import asyncio
 import uvicorn
+import logging
+from logging.handlers import RotatingFileHandler
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from datetime import datetime, date, timedelta, timezone
@@ -18,6 +20,53 @@ if project_root not in sys.path:
 
 # Load .env file before anything else (highest priority for credentials)
 load_dotenv()
+
+# Configure logging with rotation and spam protection
+def setup_logging():
+    """Setup logging with rotation and level filtering"""
+    # Create logs directory if it doesn't exist
+    os.makedirs("logs", exist_ok=True)
+    
+    # Setup root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)  # Only INFO and above
+    
+    # Remove existing handlers
+    root_logger.handlers.clear()
+    
+    # Create rotating file handler (max 10MB, keep 5 files)
+    file_handler = RotatingFileHandler(
+        'logs/bot.log',
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,          # Keep 5 backup files
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
+    
+    # Create console handler (for important messages)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.WARNING)  # Only warnings and errors to console
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    # Suppress noisy loggers
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    
+    return root_logger
+
+# Setup logging before importing other modules
+setup_logging()
 
 from src.config import Config
 from src.core.trading_engine import TradingEngine

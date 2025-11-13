@@ -8,6 +8,7 @@ from src.utils.pip_calculator import PipCalculator
 from src.managers.risk_manager import RiskManager
 import uuid
 import logging
+import time
 
 class ProfitBookingManager:
     """
@@ -34,12 +35,21 @@ class ProfitBookingManager:
         # Get configuration
         self.profit_config = config.get("profit_booking_config", {})
         self.enabled = self.profit_config.get("enabled", True)
-        self.profit_targets = self.profit_config.get("profit_targets", [10, 20, 40, 80, 160])
+        # NEW: Fixed $7 minimum profit for all levels (replaces progressive targets)
+        self.min_profit = self.profit_config.get("min_profit", 7.0)  # $7 minimum per order
         self.multipliers = self.profit_config.get("multipliers", [1, 2, 4, 8, 16])
-        self.sl_reductions = self.profit_config.get("sl_reductions", [0, 10, 25, 40, 50])
         self.max_level = self.profit_config.get("max_level", 4)
         
+        # Import profit booking SL calculator
+        from src.utils.profit_sl_calculator import ProfitBookingSLCalculator
+        self.profit_sl_calculator = ProfitBookingSLCalculator(config)
+        
         self.logger = logging.getLogger(__name__)
+        
+        # Error deduplication: Track missing order checks to prevent spam
+        self.checked_missing_orders: Dict[str, int] = {}  # order_id -> check_count
+        self.last_error_log_time: Dict[str, float] = {}  # order_id -> last_log_timestamp
+        self.stale_chains: set = set()  # Chains marked as stale
     
     def is_enabled(self) -> bool:
         """Check if profit booking system is enabled"""
@@ -71,9 +81,9 @@ class ProfitBookingManager:
                 status="ACTIVE",
                 created_at=datetime.now().isoformat(),
                 updated_at=datetime.now().isoformat(),
-                profit_targets=self.profit_targets.copy(),
+                profit_targets=[self.min_profit] * (self.max_level + 1),  # All levels use $7 minimum
                 multipliers=self.multipliers.copy(),
-                sl_reductions=self.sl_reductions.copy(),
+                sl_reductions=[0] * (self.max_level + 1),  # No SL reduction (uses fixed $10 SL)
                 metadata={
                     "strategy": trade.strategy,
                     "original_entry": trade.entry,
@@ -94,8 +104,8 @@ class ProfitBookingManager:
                     str(trade.trade_id),
                     chain_id,
                     0,
-                    self.profit_targets[0],
-                    int(self.sl_reductions[0]),
+                    self.min_profit,  # $7 minimum
+                    0,  # No SL reduction (uses fixed $10 SL)
                     "OPEN"
                 )
             
@@ -107,10 +117,9 @@ class ProfitBookingManager:
             return None
     
     def get_profit_target(self, level: int) -> float:
-        """Get profit target for a specific level"""
-        if 0 <= level < len(self.profit_targets):
-            return self.profit_targets[level]
-        return 0.0
+        """Get profit target for a specific level (DEPRECATED - kept for compatibility)"""
+        # Always return min_profit for all levels
+        return self.min_profit
     
     def get_order_multiplier(self, level: int) -> int:
         """Get order multiplier for a specific level"""
@@ -119,9 +128,8 @@ class ProfitBookingManager:
         return 1
     
     def get_sl_reduction(self, level: int) -> float:
-        """Get SL reduction percentage for a specific level"""
-        if 0 <= level < len(self.sl_reductions):
-            return self.sl_reductions[level]
+        """Get SL reduction percentage for a specific level (DEPRECATED - always returns 0 for fixed $10 SL)"""
+        # Always return 0 - profit booking uses fixed $10 SL, no reductions
         return 0.0
     
     def calculate_combined_pnl(self, chain: ProfitBookingChain, 
@@ -175,32 +183,296 @@ class ProfitBookingManager:
             self.logger.error(f"Error calculating combined PnL: {str(e)}")
             return 0.0
     
+    def calculate_individual_pnl(self, trade: Trade, current_price: float) -> float:
+        """
+        Calculate individual order PnL (for profit booking)
+        Returns PnL in dollars for a single order
+        """
+        try:
+            if current_price == 0:
+                current_price = self.mt5_client.get_current_price(trade.symbol)
+                if current_price == 0:
+                    return 0.0
+            
+            symbol_config = self.config["symbol_config"][trade.symbol]
+            pip_size = symbol_config["pip_size"]
+            pip_value_per_std_lot = symbol_config["pip_value_per_std_lot"]
+            
+            # Calculate price difference in pips
+            if trade.direction == "buy":
+                price_diff = current_price - trade.entry
+            else:
+                price_diff = trade.entry - current_price
+            
+            pips_moved = price_diff / pip_size
+            
+            # Calculate PnL: pips × pip_value × lot_size
+            pip_value = pip_value_per_std_lot * trade.lot_size
+            trade_pnl = pips_moved * pip_value
+            
+            return trade_pnl
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating individual PnL for trade {trade.trade_id}: {str(e)}")
+            return 0.0
+    
+    def should_book_order(self, trade: Trade, current_price: float) -> bool:
+        """
+        Check if order should be booked (≥ $7 profit)
+        Returns True if profit >= min_profit, False otherwise
+        """
+        pnl = self.calculate_individual_pnl(trade, current_price)
+        should_book = pnl >= self.min_profit
+        
+        if should_book:
+            self.logger.debug(
+                f"[PROFIT_BOOKING] Order {trade.trade_id} should be booked: "
+                f"PnL=${pnl:.2f} >= ${self.min_profit:.2f}"
+            )
+        
+        return should_book
+    
     def check_profit_targets(self, chain: ProfitBookingChain, 
-                            open_trades: List[Trade]) -> bool:
+                            open_trades: List[Trade]) -> List[Trade]:
         """
-        Check if profit target is reached for current level
-        Returns True if target reached, False otherwise
+        NEW: Check individual orders for profit booking (≥ $7 per order)
+        Returns list of orders that should be booked immediately
+        Changed from combined PnL check to individual order check
         """
+        orders_to_book = []
+        
         if chain.status != "ACTIVE":
-            return False
+            return orders_to_book
         
         if chain.current_level >= chain.max_level:
-            return False
+            return orders_to_book
         
-        # Calculate combined PnL for current level
-        combined_pnl = self.calculate_combined_pnl(chain, open_trades)
+        # Get all trades for this chain at current level
+        chain_trades = [
+            t for t in open_trades
+            if t.profit_chain_id == chain.chain_id 
+            and t.profit_level == chain.current_level
+            and t.status == "open"
+        ]
         
-        # Get profit target for current level
-        profit_target = self.get_profit_target(chain.current_level)
+        if not chain_trades:
+            return orders_to_book
         
-        if combined_pnl >= profit_target:
-            self.logger.info(
-                f"✅ Profit target reached: Chain {chain.chain_id} "
-                f"Level {chain.current_level} - ${combined_pnl:.2f} >= ${profit_target}"
+        # Get current price once
+        current_price = self.mt5_client.get_current_price(chain.symbol)
+        if current_price == 0:
+            return orders_to_book
+        
+        # Check each order individually
+        for trade in chain_trades:
+            if self.should_book_order(trade, current_price):
+                orders_to_book.append(trade)
+                self.logger.info(
+                    f"✅ Order {trade.trade_id} ready to book: "
+                    f"Chain {chain.chain_id} Level {chain.current_level} - "
+                    f"PnL=${self.calculate_individual_pnl(trade, current_price):.2f} >= ${self.min_profit:.2f}"
+                )
+        
+        return orders_to_book
+    
+    async def book_individual_order(self, trade: Trade, chain: ProfitBookingChain,
+                                   open_trades: List[Trade], trading_engine) -> bool:
+        """
+        Book a single order immediately when it reaches ≥ $7 profit
+        Returns True if successfully booked, False otherwise
+        """
+        try:
+            # Get current price
+            current_price = self.mt5_client.get_current_price(trade.symbol)
+            if current_price == 0:
+                self.logger.error(f"Failed to get current price for {trade.symbol}")
+                return False
+            
+            # Calculate profit for this order
+            profit_booked = self.calculate_individual_pnl(trade, current_price)
+            
+            # Close the order
+            await trading_engine.close_trade(trade, "PROFIT_BOOKING", current_price)
+            
+            # Update chain profit
+            chain.total_profit += profit_booked
+            chain.updated_at = datetime.now().isoformat()
+            self.db.save_profit_chain(chain)
+            
+            # Save profit booking event
+            self.db.save_profit_booking_event(
+                chain.chain_id,
+                chain.current_level,
+                profit_booked,
+                1,  # 1 order closed
+                0   # 0 orders placed (will be placed when level progresses)
             )
+            
+            self.logger.info(
+                f"✅ Individual order booked: Trade {trade.trade_id} "
+                f"Chain {chain.chain_id} Level {chain.current_level} "
+                f"Profit: ${profit_booked:.2f}"
+            )
+            
             return True
-        
-        return False
+            
+        except Exception as e:
+            self.logger.error(f"Error booking individual order {trade.trade_id}: {str(e)}")
+            return False
+    
+    async def check_and_progress_chain(self, chain: ProfitBookingChain,
+                                      open_trades: List[Trade], trading_engine) -> bool:
+        """
+        Check if all orders in current level are closed, then progress to next level
+        Returns True if progressed, False otherwise
+        """
+        try:
+            if chain.status != "ACTIVE":
+                return False
+            
+            if chain.current_level >= chain.max_level:
+                # Max level reached - complete chain
+                chain.status = "COMPLETED"
+                chain.updated_at = datetime.now().isoformat()
+                self.db.save_profit_chain(chain)
+                self.logger.info(f"SUCCESS: Chain {chain.chain_id} completed - max level reached")
+                return True
+            
+            # Check if all orders in current level are closed
+            current_level_trades = [
+                t for t in open_trades
+                if t.profit_chain_id == chain.chain_id 
+                and t.profit_level == chain.current_level
+                and t.status == "open"
+            ]
+            
+            # If there are still open orders, don't progress yet
+            if current_level_trades:
+                self.logger.debug(
+                    f"Chain {chain.chain_id} Level {chain.current_level}: "
+                    f"{len(current_level_trades)} orders still open, waiting for all to close"
+                )
+                return False
+            
+            # All orders closed - progress to next level
+            self.logger.info(
+                f"✅ All orders closed in Level {chain.current_level}, "
+                f"progressing to Level {chain.current_level + 1}"
+            )
+            
+            # Progress to next level
+            next_level = chain.current_level + 1
+            next_order_count = self.get_order_multiplier(next_level)
+            
+            # Place new orders for next level
+            account_balance = self.mt5_client.get_account_balance()
+            lot_size = self.risk_manager.get_fixed_lot_size(account_balance)
+            
+            # Get current price
+            current_price = self.mt5_client.get_current_price(chain.symbol)
+            if current_price == 0:
+                self.logger.error(f"Failed to get current price for {chain.symbol}")
+                return False
+            
+            # Use independent $10 SL for profit booking orders
+            sl_price, sl_distance = self.profit_sl_calculator.calculate_sl_price(
+                current_price, chain.direction, chain.symbol, lot_size
+            )
+            
+            # Calculate TP (using RR ratio)
+            tp_price = self.pip_calculator.calculate_tp_price(
+                current_price, sl_price, chain.direction, self.config.get("rr_ratio", 1.0)
+            )
+            
+            # Place multiple orders for next level
+            new_trade_ids = []
+            orders_placed = 0
+            
+            for i in range(next_order_count):
+                # Create trade object
+                new_trade = Trade(
+                    symbol=chain.symbol,
+                    entry=current_price,
+                    sl=sl_price,
+                    tp=tp_price,
+                    lot_size=lot_size,
+                    direction=chain.direction,
+                    strategy=chain.metadata.get("strategy", "LOGIC1"),
+                    open_time=datetime.now().isoformat(),
+                    original_entry=chain.metadata.get("original_entry", current_price),
+                    original_sl_distance=sl_distance,
+                    order_type="PROFIT_TRAIL",
+                    profit_chain_id=chain.chain_id,
+                    profit_level=next_level
+                )
+                
+                # Place order
+                if not self.config.get("simulate_orders", False):
+                    trade_id = self.mt5_client.place_order(
+                        symbol=chain.symbol,
+                        order_type=chain.direction,
+                        lot_size=lot_size,
+                        price=current_price,
+                        sl=sl_price,
+                        tp=tp_price,
+                        comment=f"{chain.metadata.get('strategy', 'LOGIC1')}_PROFIT_L{next_level}"
+                    )
+                    if trade_id:
+                        new_trade.trade_id = trade_id
+                        new_trade_ids.append(trade_id)
+                else:
+                    # Simulation mode
+                    import random
+                    trade_id = random.randint(100000, 999999)
+                    new_trade.trade_id = trade_id
+                    new_trade_ids.append(trade_id)
+                
+                # Add to open trades
+                trading_engine.open_trades.append(new_trade)
+                trading_engine.risk_manager.add_open_trade(new_trade)
+                
+                # Save to database
+                if new_trade.trade_id:
+                    self.db.save_profit_booking_order(
+                        str(new_trade.trade_id),
+                        chain.chain_id,
+                        next_level,
+                        self.min_profit,  # $7 minimum
+                        0,  # No SL reduction for profit booking (uses fixed $10 SL)
+                        "OPEN"
+                    )
+                
+                orders_placed += 1
+            
+            # Update chain
+            chain.current_level = next_level
+            chain.active_orders = new_trade_ids
+            chain.updated_at = datetime.now().isoformat()
+            self.db.save_profit_chain(chain)
+            
+            # Send Telegram notification
+            trading_engine.telegram_bot.send_message(
+                f"🔁 PROFIT BOOKING LEVEL UP!\n"
+                f"Chain: {chain.chain_id}\n"
+                f"Level: {chain.current_level - 1} → {chain.current_level}\n"
+                f"Orders Placed: {orders_placed}\n"
+                f"Next Target: ${self.min_profit:.2f} per order\n"
+                f"SL: $10 fixed per order"
+            )
+            
+            self.logger.info(
+                f"✅ Chain progressed: {chain.chain_id} "
+                f"Level {chain.current_level - 1} → {chain.current_level}, "
+                f"Orders placed: {orders_placed}"
+            )
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error checking and progressing chain {chain.chain_id}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
     
     async def execute_profit_booking(self, chain: ProfitBookingChain, 
                                     open_trades: List[Trade],
@@ -251,7 +523,6 @@ class ProfitBookingManager:
             next_level = chain.current_level + 1
             next_order_count = self.get_order_multiplier(next_level)
             next_profit_target = self.get_profit_target(next_level)
-            next_sl_reduction = self.get_sl_reduction(next_level)
             
             # Place new orders for next level
             orders_placed = 0
@@ -264,11 +535,9 @@ class ProfitBookingManager:
                 self.logger.error(f"Failed to get current price for {chain.symbol}")
                 return False
             
-            # Calculate SL with reduction for next level
-            sl_adjustment = 1.0 - (next_sl_reduction / 100.0)
-            sl_price, sl_distance = self.pip_calculator.calculate_sl_price(
-                chain.symbol, current_price, chain.direction, 
-                lot_size, account_balance, sl_adjustment
+            # Use independent $10 SL for profit booking orders (not TP Trail SL system)
+            sl_price, sl_distance = self.profit_sl_calculator.calculate_sl_price(
+                current_price, chain.direction, chain.symbol, lot_size
             )
             
             tp_price = self.pip_calculator.calculate_tp_price(
@@ -326,8 +595,8 @@ class ProfitBookingManager:
                         str(new_trade.trade_id),
                         chain.chain_id,
                         next_level,
-                        next_profit_target,
-                        int(next_sl_reduction),
+                        self.min_profit,  # $7 minimum
+                        0,  # No SL reduction (uses fixed $10 SL)
                         "OPEN"
                     )
                 
@@ -356,8 +625,8 @@ class ProfitBookingManager:
                 f"Profit Booked: ${profit_booked:.2f}\n"
                 f"Orders Closed: {orders_closed}\n"
                 f"Orders Placed: {orders_placed}\n"
-                f"Next Target: ${next_profit_target}\n"
-                f"SL Reduction: {next_sl_reduction}%"
+                f"Next Target: ${self.min_profit:.2f} per order\n"
+                f"SL: $10 fixed per order"
             )
             
             self.logger.info(
@@ -409,9 +678,9 @@ class ProfitBookingManager:
                         status=chain_data.get("status", "ACTIVE"),
                         created_at=chain_data.get("created_at", datetime.now().isoformat()),
                         updated_at=chain_data.get("updated_at", datetime.now().isoformat()),
-                        profit_targets=self.profit_targets.copy(),
+                        profit_targets=[self.min_profit] * (self.max_level + 1),  # All levels use $7 minimum
                         multipliers=self.multipliers.copy(),
-                        sl_reductions=self.sl_reductions.copy(),
+                        sl_reductions=[0] * (self.max_level + 1),  # No SL reduction (uses fixed $10 SL)
                         metadata={}
                     )
                     
@@ -447,11 +716,20 @@ class ProfitBookingManager:
         """
         Validate chain state integrity
         Returns True if valid, False otherwise
+        Implements error deduplication to prevent log spam
         """
         try:
             # Check if chain exists
             if chain.chain_id not in self.active_chains:
                 return False
+            
+            # Skip validation for stale chains
+            if chain.chain_id in self.stale_chains:
+                return False
+            
+            # Track missing orders for this chain
+            missing_orders = []
+            valid_orders = []
             
             # Check if all active orders still exist
             for order_id in chain.active_orders:
@@ -459,12 +737,52 @@ class ProfitBookingManager:
                     t.trade_id == order_id and t.status == "open"
                     for t in open_trades
                 )
+                
                 if not order_exists:
-                    self.logger.warning(
-                        f"Chain {chain.chain_id} has missing order: {order_id}"
-                    )
+                    missing_orders.append(order_id)
+                    
+                    # Track check count for this order
+                    order_key = f"{chain.chain_id}:{order_id}"
+                    check_count = self.checked_missing_orders.get(order_key, 0)
+                    
+                    # Stop checking after 3 attempts
+                    if check_count >= 3:
+                        continue  # Skip logging, already checked 3 times
+                    
+                    # Increment check count
+                    self.checked_missing_orders[order_key] = check_count + 1
+                    
+                    # Log error only once per 5 minutes per order
+                    current_time = time.time()
+                    last_log = self.last_error_log_time.get(order_key, 0)
+                    
+                    if current_time - last_log > 300:  # 5 minutes
+                        self.logger.warning(
+                            f"Chain {chain.chain_id} has missing order: {order_id} "
+                            f"(check {check_count + 1}/3)"
+                        )
+                        self.last_error_log_time[order_key] = current_time
+                else:
+                    valid_orders.append(order_id)
             
-            return True
+            # If all orders are missing and checked 3+ times, mark chain as stale
+            if len(missing_orders) == len(chain.active_orders) and len(valid_orders) == 0:
+                all_checked = all(
+                    self.checked_missing_orders.get(f"{chain.chain_id}:{order_id}", 0) >= 3
+                    for order_id in missing_orders
+                )
+                
+                if all_checked and chain.chain_id not in self.stale_chains:
+                    self.logger.warning(
+                        f"Marking chain {chain.chain_id} as STALE - all orders missing after 3 checks"
+                    )
+                    self.stale_chains.add(chain.chain_id)
+                    # Optionally stop the chain
+                    self.stop_chain(chain.chain_id, "All orders missing - marked stale")
+                    return False
+            
+            # Return True if at least some orders exist
+            return len(valid_orders) > 0
             
         except Exception as e:
             self.logger.error(f"Error validating chain state: {str(e)}")
@@ -486,4 +804,51 @@ class ProfitBookingManager:
                     )
         except Exception as e:
             self.logger.error(f"Error handling orphaned orders: {str(e)}")
+    
+    def cleanup_stale_chains(self):
+        """
+        Clean up stale chains that have all missing orders
+        Specifically removes the problematic chain PROFIT_XAUUSD_aacf09c3
+        """
+        try:
+            chains_to_remove = []
+            
+            # Check for the specific problematic chain
+            if "PROFIT_XAUUSD_aacf09c3" in self.active_chains:
+                chains_to_remove.append("PROFIT_XAUUSD_aacf09c3")
+                self.logger.info("Removing stale chain: PROFIT_XAUUSD_aacf09c3")
+            
+            # Also check other stale chains
+            for chain_id in self.stale_chains:
+                if chain_id in self.active_chains and chain_id not in chains_to_remove:
+                    chains_to_remove.append(chain_id)
+            
+            # Remove stale chains
+            for chain_id in chains_to_remove:
+                if chain_id in self.active_chains:
+                    chain = self.active_chains[chain_id]
+                    chain.status = "STALE"
+                    chain.updated_at = datetime.now().isoformat()
+                    self.db.save_profit_chain(chain)
+                    del self.active_chains[chain_id]
+                    self.logger.info(f"Removed stale chain: {chain_id}")
+            
+            # Clean up tracking dictionaries for removed chains
+            keys_to_remove = [
+                key for key in self.checked_missing_orders.keys()
+                if any(key.startswith(f"{chain_id}:") for chain_id in chains_to_remove)
+            ]
+            for key in keys_to_remove:
+                del self.checked_missing_orders[key]
+                if key in self.last_error_log_time:
+                    del self.last_error_log_time[key]
+            
+            # Remove from stale_chains set
+            self.stale_chains -= set(chains_to_remove)
+            
+            if chains_to_remove:
+                self.logger.info(f"Cleaned up {len(chains_to_remove)} stale chain(s)")
+            
+        except Exception as e:
+            self.logger.error(f"Error cleaning up stale chains: {str(e)}")
 

@@ -86,13 +86,23 @@ class TimeframeTrendManager:
     def check_logic_alignment(self, symbol: str, logic: str) -> Dict[str, Any]:
         """Check if trends align for a specific trading logic"""
         
+        import logging
+        logger = logging.getLogger(__name__)
+        
         result = {
             "aligned": False,
             "direction": "NEUTRAL",
-            "details": {}
+            "details": {},
+            "failure_reason": None
         }
         
+        # DIAGNOSTIC: Check if symbol exists in trends
         if symbol not in self.trends["symbols"]:
+            result["failure_reason"] = f"Symbol {symbol} not found in trends dictionary"
+            logger.debug(
+                f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ Symbol not in trends. "
+                f"Available symbols: {list(self.trends['symbols'].keys())}"
+            )
             return result
         
         symbol_trends = self.trends["symbols"][symbol]
@@ -103,9 +113,32 @@ class TimeframeTrendManager:
             
             result["details"] = {"1h": h1_trend, "15m": m15_trend}
             
-            if h1_trend != "NEUTRAL" and h1_trend == m15_trend:
+            # DIAGNOSTIC: Log alignment check details
+            if h1_trend == "NEUTRAL":
+                result["failure_reason"] = "1H trend is NEUTRAL"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ 1H trend is NEUTRAL "
+                    f"(1H={h1_trend}, 15M={m15_trend})"
+                )
+            elif m15_trend == "NEUTRAL":
+                result["failure_reason"] = "15M trend is NEUTRAL"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ 15M trend is NEUTRAL "
+                    f"(1H={h1_trend}, 15M={m15_trend})"
+                )
+            elif h1_trend != m15_trend:
+                result["failure_reason"] = f"Trends don't match: 1H={h1_trend} != 15M={m15_trend}"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ Trends don't match "
+                    f"(1H={h1_trend}, 15M={m15_trend})"
+                )
+            else:
                 result["aligned"] = True
                 result["direction"] = h1_trend
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ✅ ALIGNED "
+                    f"(1H={h1_trend}, 15M={m15_trend}, Direction={h1_trend})"
+                )
                 
         elif logic == "LOGIC2":  # 1H bias + 15M trend for 15M entries
             h1_trend = symbol_trends.get("1h", {}).get("trend", "NEUTRAL")
@@ -113,9 +146,32 @@ class TimeframeTrendManager:
             
             result["details"] = {"1h": h1_trend, "15m": m15_trend}
             
-            if h1_trend != "NEUTRAL" and h1_trend == m15_trend:
+            # DIAGNOSTIC: Log alignment check details
+            if h1_trend == "NEUTRAL":
+                result["failure_reason"] = "1H trend is NEUTRAL"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ 1H trend is NEUTRAL "
+                    f"(1H={h1_trend}, 15M={m15_trend})"
+                )
+            elif m15_trend == "NEUTRAL":
+                result["failure_reason"] = "15M trend is NEUTRAL"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ 15M trend is NEUTRAL "
+                    f"(1H={h1_trend}, 15M={m15_trend})"
+                )
+            elif h1_trend != m15_trend:
+                result["failure_reason"] = f"Trends don't match: 1H={h1_trend} != 15M={m15_trend}"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ Trends don't match "
+                    f"(1H={h1_trend}, 15M={m15_trend})"
+                )
+            else:
                 result["aligned"] = True
                 result["direction"] = h1_trend
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ✅ ALIGNED "
+                    f"(1H={h1_trend}, 15M={m15_trend}, Direction={h1_trend})"
+                )
                 
         elif logic == "LOGIC3":  # 1D bias + 1H trend for 1H entries
             d1_trend = symbol_trends.get("1d", {}).get("trend", "NEUTRAL")
@@ -123,9 +179,35 @@ class TimeframeTrendManager:
             
             result["details"] = {"1d": d1_trend, "1h": h1_trend}
             
-            if d1_trend != "NEUTRAL" and d1_trend == h1_trend:
+            # DIAGNOSTIC: Log alignment check details
+            if d1_trend == "NEUTRAL":
+                result["failure_reason"] = "1D trend is NEUTRAL"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ 1D trend is NEUTRAL "
+                    f"(1D={d1_trend}, 1H={h1_trend})"
+                )
+            elif h1_trend == "NEUTRAL":
+                result["failure_reason"] = "1H trend is NEUTRAL"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ 1H trend is NEUTRAL "
+                    f"(1D={d1_trend}, 1H={h1_trend})"
+                )
+            elif d1_trend != h1_trend:
+                result["failure_reason"] = f"Trends don't match: 1D={d1_trend} != 1H={h1_trend}"
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ Trends don't match "
+                    f"(1D={d1_trend}, 1H={h1_trend})"
+                )
+            else:
                 result["aligned"] = True
                 result["direction"] = d1_trend
+                logger.debug(
+                    f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ✅ ALIGNED "
+                    f"(1D={d1_trend}, 1H={h1_trend}, Direction={d1_trend})"
+                )
+        else:
+            result["failure_reason"] = f"Unknown logic: {logic}"
+            logger.warning(f"🔍 [ALIGNMENT_CHECK] {symbol} {logic}: ❌ Unknown logic")
         
         return result
     

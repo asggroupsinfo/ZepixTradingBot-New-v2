@@ -1,0 +1,27 @@
+2025-11-14 02:35:57 - src.core.trading_engine - INFO - 📋 [RE-ENTRY_CONFIG] Startup Configuration:
+  SL Hunt Enabled: True
+  TP Re-entry Enabled: True
+  Exit Continuation Enabled: True
+  Monitor Interval: 30s
+  SL Hunt Offset: 1.0 pips
+  TP Continuation Gap: 2.0 pips
+  Max Chain Levels: 2
+  SL Reduction Per Level: 0.5
+2025-11-14 02:35:57 - src.services.price_monitor_service - INFO - ✅ Price Monitor Service started successfully - Task created: <Task pending name='Task-3' coro=<PriceMonitorService._monitor_loop() running at C:\Users\Ansh Shivaay Gupta\Downloads\ZepixTradingBot-old-v2-main\ZepixTradingBot-old-v2-main\src\services\price_monitor_service.py:124>>, is_running: True
+2025-11-14 02:35:57 - src.core.trading_engine - INFO - ✅ Price Monitor Service confirmed running after initialization
+2025-11-14 02:35:57 - src.managers.profit_booking_manager - INFO - SUCCESS: Recovered 0 profit booking chains from database
+2025-11-14 02:35:59 - src.services.price_monitor_service - INFO - 🔄 Monitor loop started - Interval: 30s, Config: SL Hunt=True, TP=True, Exit=True
+2025-11-14 02:37:45 - src.core.trading_engine - INFO - 📋 [RE-ENTRY_CONFIG] Startup Configuration:
+  SL Hunt Enabled: True
+  TP Re-entry Enabled: True
+  Exit Continuation Enabled: True
+  Monitor Interval: 30s
+  SL Hunt Offset: 1.0 pips
+  TP Continuation Gap: 2.0 pips
+  Max Chain Levels: 2
+  SL Reduction Per Level: 0.5
+2025-11-14 02:37:45 - src.services.price_monitor_service - INFO - ✅ Price Monitor Service started successfully - Task created: <Task pending name='Task-3' coro=<PriceMonitorService._monitor_loop() running at C:\Users\Ansh Shivaay Gupta\Downloads\ZepixTradingBot-old-v2-main\ZepixTradingBot-old-v2-main\src\services\price_monitor_service.py:124>>, is_running: True
+2025-11-14 02:37:45 - src.core.trading_engine - INFO - ✅ Price Monitor Service confirmed running after initialization
+2025-11-14 02:37:45 - src.managers.profit_booking_manager - INFO - SUCCESS: Recovered 0 profit booking chains from database
+2025-11-14 02:37:47 - src.services.price_monitor_service - INFO - 🔄 Monitor loop started - Interval: 30s, Config: SL Hunt=True, TP=True, Exit=True
+2025-11-14 02:42:17 - src.services.price_monitor_service - INFO - 💓 Monitor loop heartbeat - Cycle #10, Running: True, Pending: SL Hunt=0, TP=0, Exit=0

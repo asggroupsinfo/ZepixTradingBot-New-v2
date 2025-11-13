@@ -38,11 +38,13 @@ class TradingEngine:
         self.reentry_manager = ReEntryManager(config)
         
         # NEW: Dual order and profit booking managers
-        self.dual_order_manager = DualOrderManager(
-            config, risk_manager, mt5_client, self.pip_calculator
-        )
         self.profit_booking_manager = ProfitBookingManager(
             config, mt5_client, self.pip_calculator, risk_manager, self.db
+        )
+        # Pass profit SL calculator to dual order manager for Order B
+        self.dual_order_manager = DualOrderManager(
+            config, risk_manager, mt5_client, self.pip_calculator,
+            profit_sl_calculator=self.profit_booking_manager.profit_sl_calculator
         )
         
         # NEW: Advanced re-entry and exit handlers
@@ -73,14 +75,38 @@ class TradingEngine:
             self.telegram_bot.send_message("✅ MT5 Connection Established")
             self.telegram_bot.set_trend_manager(self.trend_manager)
             
+            # DIAGNOSTIC: Log re-entry configuration on startup
+            re_entry_config = self.config.get("re_entry_config", {})
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"📋 [RE-ENTRY_CONFIG] Startup Configuration:\n"
+                f"  SL Hunt Enabled: {re_entry_config.get('sl_hunt_reentry_enabled', False)}\n"
+                f"  TP Re-entry Enabled: {re_entry_config.get('tp_reentry_enabled', False)}\n"
+                f"  Exit Continuation Enabled: {re_entry_config.get('exit_continuation_enabled', False)}\n"
+                f"  Monitor Interval: {re_entry_config.get('price_monitor_interval_seconds', 30)}s\n"
+                f"  SL Hunt Offset: {re_entry_config.get('sl_hunt_offset_pips', 1.0)} pips\n"
+                f"  TP Continuation Gap: {re_entry_config.get('tp_continuation_price_gap_pips', 2.0)} pips\n"
+                f"  Max Chain Levels: {re_entry_config.get('max_chain_levels', 2)}\n"
+                f"  SL Reduction Per Level: {re_entry_config.get('sl_reduction_per_level', 0.5)}"
+            )
+            
             # Start background price monitor
             await self.price_monitor.start()
+            
+            # DIAGNOSTIC: Verify service started
+            if self.price_monitor.is_running:
+                logger.info("✅ Price Monitor Service confirmed running after initialization")
+            else:
+                logger.error("❌ Price Monitor Service NOT running after initialization")
             
             # Recover profit booking chains from database
             if self.profit_booking_manager.is_enabled():
                 self.profit_booking_manager.recover_chains_from_database(self.open_trades)
                 # Handle orphaned orders
                 self.profit_booking_manager.handle_orphaned_orders(self.open_trades)
+                # Clean up stale chains (fixes infinite loop spam)
+                self.profit_booking_manager.cleanup_stale_chains()
             
             print("SUCCESS: Trading engine initialized successfully")
             print("SUCCESS: Price monitor service started")
@@ -251,6 +277,7 @@ class TradingEngine:
                 # Handle Order B (Profit Trail)
                 if dual_result["order_b_placed"] and dual_result["order_b"]:
                     order_b = dual_result["order_b"]
+                    # Order B already has independent $10 SL from dual_order_manager
                     # Create profit booking chain for Order B
                     if self.profit_booking_manager.is_enabled():
                         profit_chain = self.profit_booking_manager.create_profit_chain(order_b)
@@ -722,12 +749,38 @@ class TradingEngine:
                     # Check TP hit
                     if ((trade.direction == "buy" and current_price >= trade.tp) or
                         (trade.direction == "sell" and current_price <= trade.tp)):
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        
+                        # DIAGNOSTIC: Log TP hit and registration attempt
+                        logger.info(
+                            f"🎯 [TP_HIT] Trade {trade.trade_id}: {trade.symbol} {trade.direction.upper()} "
+                            f"TP={trade.tp:.5f} Current={current_price:.5f} "
+                            f"Chain={trade.chain_id} Strategy={trade.strategy}"
+                        )
+                        
                         await self.close_trade(trade, "TP_HIT", current_price)
                         self.reentry_manager.record_tp_hit(trade, current_price)
                         
                         # NEW: Register for TP continuation re-entry monitoring
-                        if self.config["re_entry_config"]["tp_reentry_enabled"]:
+                        tp_reentry_enabled = self.config["re_entry_config"].get("tp_reentry_enabled", False)
+                        logger.info(
+                            f"📝 [TP_CONTINUATION_REGISTRATION_ATTEMPT] Trade {trade.trade_id}: "
+                            f"TP Re-entry Enabled={tp_reentry_enabled}, "
+                            f"Chain ID={trade.chain_id}, Strategy={trade.strategy}"
+                        )
+                        
+                        if tp_reentry_enabled:
                             self.price_monitor.register_tp_continuation(trade, current_price, trade.strategy)
+                            logger.info(
+                                f"✅ [TP_CONTINUATION_REGISTERED] Trade {trade.trade_id}: "
+                                f"Successfully registered for TP continuation monitoring"
+                            )
+                        else:
+                            logger.warning(
+                                f"⚠️ [TP_CONTINUATION_SKIPPED] Trade {trade.trade_id}: "
+                                f"TP re-entry is disabled in config"
+                            )
                         continue
                     
                     # Check trend reversal exit

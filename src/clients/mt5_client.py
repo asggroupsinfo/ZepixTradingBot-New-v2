@@ -6,9 +6,12 @@ except ImportError:
     print("WARNING: MetaTrader5 not available (Windows only). Running in simulation mode.")
 
 import time
+import logging
 from typing import Dict, Any, Optional
 from src.config import Config
 from src.models import Trade
+
+logger = logging.getLogger(__name__)
 
 class MT5Client:
     def __init__(self, config: Config):
@@ -16,15 +19,30 @@ class MT5Client:
         self.initialized = False
         # Load symbol mapping from config for broker compatibility
         self.symbol_mapping = config.get("symbol_mapping", {})
+        # Cache for symbol mappings to avoid repeated lookups and debug logs
+        self.symbol_cache = {}
 
     def _map_symbol(self, symbol: str) -> str:
         """
         Map TradingView symbol to broker's MT5 symbol
         Example: XAUUSD (TradingView) -> GOLD (XM Broker)
+        Uses caching to prevent repeated lookups and debug logs
         """
+        # Check cache first
+        if symbol in self.symbol_cache:
+            return self.symbol_cache[symbol]
+        
+        # Perform mapping (existing logic)
         mapped = self.symbol_mapping.get(symbol, symbol)
+        
+        # Cache the result
+        self.symbol_cache[symbol] = mapped
+        
+        # Log only if mapping changed (existing debug log)
         if mapped != symbol:
-            print(f"Symbol mapping: {symbol} -> {mapped}")
+            # Use logger.debug instead of print to avoid spam
+            logger.debug(f"Symbol mapping: {symbol} -> {mapped}")
+        
         return mapped
 
     def initialize(self) -> bool:
